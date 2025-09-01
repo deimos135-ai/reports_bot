@@ -2,28 +2,33 @@ app = "bot-crm-reporter"
 primary_region = "fra"
 
 [build]
-  dockerfile = "Dockerfile"   # або image, якщо збираєте CI
+  dockerfile = "Dockerfile"
+
+# Процес, який слухає 0.0.0.0:8080
+[processes]
+  app = "uvicorn main:app --host 0.0.0.0 --port 8080"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = true
+  auto_stop_machines = false      # ← не давати машині засинати
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1        # ← тримаємо хоча б 1 інстанс
   processes = ["app"]
 
-[[services.ports]]
-  port = 80
-  handlers = ["http"]
-[[services.ports]]
-  port = 443
-  handlers = ["tls", "http"]
+  # (необов'язково) ліміти одночасних конектів
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 200
+    hard_limit = 250
 
-[[checks]]
-  name = "httpchk"
-  type = "http"
-  port = 8080
-  interval = "10s"
-  timeout = "2s"
-  method = "GET"
-  path = "/healthz"
+# Healthcheck на /healthz
+[checks]
+  [checks.healthz]
+    type = "http"
+    port = 8080
+    interval = "10s"
+    timeout = "2s"
+    method = "GET"
+    path = "/healthz"
+    grace_period = "10s"
