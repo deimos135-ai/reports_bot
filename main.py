@@ -119,10 +119,7 @@ def normalize_type(type_name: str) -> str:
         "сервісні роботи": "service", "сервисные работы": "service", "сервіс": "service", "сервис": "service",
         "перепідключення": "reconnection", "переподключение": "reconnection",
         "аварія": "accident", "авария": "accident",
-        "будівництво": "construction", "строительство": "construction",
         "роботи по лінії": "linework", "работы по линии": "linework",
-        "звернення в кц": "cc_request", "обращение в кц": "cc_request",
-        "не выбран": "other", "не вибрано": "other", "інше": "other", "прочее": "other",
     }
     if t in mapping_exact:
         return mapping_exact[t]
@@ -131,10 +128,7 @@ def normalize_type(type_name: str) -> str:
     if any(k in t for k in ("сервіс", "сервис")): return "service"
     if any(k in t for k in ("перепідключ", "переподключ")): return "reconnection"
     if "авар" in t: return "accident"
-    if any(k in t for k in ("будівниц", "строит")): return "construction"
     if any(k in t for k in ("ліні", "линии")): return "linework"
-    if any(k in t for k in ("кц", "контакт-центр", "колл-центр", "call")): return "cc_request"
-    return "other"
 
 REPORT_BUCKETS = [
     ("connection", "Підключення"),
@@ -144,8 +138,6 @@ REPORT_BUCKETS = [
     ("accident", "Аварії"),
     ("construction", "Будівництво"),
     ("linework", "Роботи по лінії"),
-    ("cc_request", "Звернення в КЦ"),
-    ("other", "Інше"),
 ]
 
 # ------------------------ Brigade mapping -----------------
