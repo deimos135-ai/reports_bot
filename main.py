@@ -37,7 +37,7 @@ if _raw_report_chats.strip():
 else:
     REPORT_CHATS = {}
 
-# Якщо хочеш у звіті давати лінки на угоди:
+# Якщо хочеш у звіті давати лінки на угоди (не обов'язково):
 B24_DOMAIN = os.environ.get("B24_DOMAIN", "").strip()
 
 # ------------------------ Logging -------------------------
@@ -72,13 +72,13 @@ async def b24(method: str, **params) -> Any:
                     desc = data.get("error_description")
                     # ретраїмо тільки ліміт / тимчасові
                     if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS"):
-                        log.warning("Bitrix rate-limit: %s (%s), retry #%s", err, desc, attempt+1)
+                        log.warning("Bitrix rate-limit: %s (%s), retry #%s", err, desc, attempt + 1)
                         await _sleep_backoff(attempt)
                         continue
                     raise RuntimeError(f"B24 error: {err}: {desc}")
                 return data.get("result")
         except aiohttp.ClientError as e:
-            log.warning("Bitrix network error: %s, retry #%s", e, attempt+1)
+            log.warning("Bitrix network error: %s, retry #%s", e, attempt + 1)
             await _sleep_backoff(attempt)
     raise RuntimeError("Bitrix request failed after retries")
 
@@ -116,28 +116,39 @@ def normalize_type(type_name: str) -> str:
     mapping_exact = {
         "підключення": "connection", "подключение": "connection",
         "ремонт": "repair",
-        "сервісні роботи": "service", "сервисные работы": "service", "сервіс": "service", "сервис": "service",
+        "сервісні роботи": "service", "сервисные работы": "service",
+        "сервіс": "service", "сервис": "service",
         "перепідключення": "reconnection", "переподключение": "reconnection",
         "аварія": "accident", "авария": "accident",
         "роботи по лінії": "linework", "работы по линии": "linework",
+        "не выбран": "other", "не вибрано": "other",
+        "інше": "other", "прочее": "other",
     }
     if t in mapping_exact:
         return mapping_exact[t]
-    if any(k in t for k in ("підключ", "подключ")): return "connection"
-    if "ремонт" in t: return "repair"
-    if any(k in t for k in ("сервіс", "сервис")): return "service"
-    if any(k in t for k in ("перепідключ", "переподключ")): return "reconnection"
-    if "авар" in t: return "accident"
-    if any(k in t for k in ("ліні", "линии")): return "linework"
+    # м'які правила
+    if any(k in t for k in ("підключ", "подключ")):
+        return "connection"
+    if "ремонт" in t:
+        return "repair"
+    if any(k in t for k in ("сервіс", "сервис")):
+        return "service"
+    if any(k in t for k in ("перепідключ", "переподключ")):
+        return "reconnection"
+    if "авар" in t:
+        return "accident"
+    if any(k in t for k in ("ліні", "линии")):
+        return "linework"
+    return "other"
 
 REPORT_BUCKETS = [
-    ("connection", "Підключення"),
-    ("reconnection", "Перепідключення"),
-    ("repair", "Ремонти"),
-    ("service", "Сервісні роботи"),
-    ("accident", "Аварії"),
-    ("construction", "Будівництво"),
-    ("linework", "Роботи по лінії"),
+    ("connection", "🔌 Підключення"),
+    ("reconnection", "♻️ Перепідключення"),
+    ("repair", "🛠 Ремонти"),
+    ("service", "⚙️ Сервісні роботи"),
+    ("accident", "🚨 Аварії"),
+    ("linework", "📡 Роботи по лінії"),
+    ("other", "📂 Інше"),
 ]
 
 # ------------------------ Brigade mapping -----------------
@@ -192,10 +203,18 @@ async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[
 
 def format_report(brigade: int, date_label: str, counts: Dict[str, int], active_left: int) -> str:
     total = sum(counts.values())
-    lines = [f"<b>Бригада №{brigade} — {date_label}</b>", "", f"<b>Закрито задач:</b> {total}", ""]
+    lines = [
+        f"📝 <b>Звіт по бригаді №{brigade} — {date_label}</b>",
+        "",
+        f"✅ <b>Закрито задач:</b> {total}",
+        "",
+    ]
     for key, title in REPORT_BUCKETS:
-        lines.append(f"{title} — {counts.get(key, 0)}")
-    lines += ["", f"<b>Активних задач на бригаді залишилось:</b> {active_left}"]
+        lines.append(f"{title}: {counts.get(key, 0)}")
+    lines += [
+        "",
+        f"📊 <b>Активних задач залишилось:</b> {active_left}",
+    ]
     return "\n".join(lines)
 
 async def _safe_send(chat_id: int, text: str):
@@ -205,7 +224,7 @@ async def _safe_send(chat_id: int, text: str):
             await bot.send_message(chat_id, text, disable_web_page_preview=True)
             return
         except Exception as e:
-            log.warning("telegram send failed: %s, retry #%s", e, attempt+1)
+            log.warning("telegram send failed: %s, retry #%s", e, attempt + 1)
             await _sleep_backoff(attempt)
     log.error("telegram send failed permanently")
 
@@ -246,7 +265,7 @@ async def report_now(m: Message):
         offset = int(parts[1]) if len(parts) > 1 else 0
     except:
         offset = 0
-    await m.answer("Генерую звіти…")
+    await m.answer("Генерую звіти… ⏳")
     await send_all_brigades_report(offset)
     await m.answer("Готово ✅")
 
