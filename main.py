@@ -4,16 +4,18 @@ import html
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from fastapi import FastAPI, Request
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import BotCommand, Message, Update
+from aiogram.exceptions import TelegramRetryAfter
 from zoneinfo import ZoneInfo
 
 # ------------------------ Settings ------------------------
@@ -26,6 +28,10 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "secret")
 REPORT_TZ_NAME = os.environ.get("REPORT_TZ", "Europe/Kyiv")
 REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
 REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
+
+# Увімкнення шедулера та «лідер» (щоб шедулер не дублювався на кількох інстансах)
+SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+LEADER = os.environ.get("LEADER", "0") == "1"
 
 # Куди слати: JSON-словник або один chat_id для всіх
 # приклади:
@@ -166,6 +172,16 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
     label = start_kyiv.strftime("%d.%m.%Y")
     return label, start_utc.isoformat(), end_utc.isoformat()
 
+def _day_key_in_tz() -> str:
+    return datetime.now(REPORT_TZ).strftime("%Y-%m-%d")
+
+# ------------------------ Anti-duplicate / rate limiting --
+# (chat_id, day_key, brigade) -> True (вже відправлено сьогодні)
+_sent_guard: Dict[Tuple[int, str, int], bool] = {}
+# останній час відправки в конкретний чат (секунди time.time())
+_last_chat_send_ts: Dict[int, float] = {}
+_CHAT_MIN_INTERVAL_SEC = 5  # мʼякий тротлінг: не частіше 1 повідомлення/5с у чат
+
 # ------------------------ Report core --------------------
 async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], int]:
     label, frm, to = _day_bounds(offset_days)
@@ -218,20 +234,42 @@ def format_report(brigade: int, date_label: str, counts: Dict[str, int], active_
     return "\n".join(lines)
 
 async def _safe_send(chat_id: int, text: str):
-    # ретрай на Telegram timeouts
-    for attempt in range(5):
+    # мʼякий тротлінг по чату
+    now = time.time()
+    last = _last_chat_send_ts.get(chat_id, 0.0)
+    gap = _CHAT_MIN_INTERVAL_SEC - (now - last)
+    if gap > 0:
+        await asyncio.sleep(gap)
+
+    for attempt in range(3):
         try:
             await bot.send_message(chat_id, text, disable_web_page_preview=True)
+            _last_chat_send_ts[chat_id] = time.time()
             return
+        except TelegramRetryAfter as e:
+            retry_after = int(getattr(e, "retry_after", 15))
+            log.warning("telegram 429 in chat %s, retry_after=%s (attempt %s)", chat_id, retry_after, attempt + 1)
+            await asyncio.sleep(retry_after)
         except Exception as e:
             log.warning("telegram send failed: %s, retry #%s", e, attempt + 1)
-            await _sleep_backoff(attempt)
-    log.error("telegram send failed permanently")
+            await asyncio.sleep(2 + attempt * 2)
+    log.error("telegram send failed permanently (chat %s)", chat_id)
 
 async def _send_one_brigade_report(brigade: int, chat_id: int, offset_days: int) -> None:
     try:
+        day_key = _day_key_in_tz()
+        guard_key = (chat_id, day_key, brigade)
+
+        # Ідемпотентність: за сьогодні в цей чат по цій бригаді — тільки раз
+        if offset_days == 0 and _sent_guard.get(guard_key):
+            log.info("Skip duplicate: chat=%s day=%s brigade=%s", chat_id, day_key, brigade)
+            return
+
         label, counts, active_left = await build_daily_report(brigade, offset_days)
         await _safe_send(chat_id, format_report(brigade, label, counts, active_left))
+
+        if offset_days == 0:
+            _sent_guard[guard_key] = True
     except Exception as e:
         log.exception("Report for brigade %s failed", brigade)
         await _safe_send(chat_id, f"❗️Помилка формування звіту для бригади №{brigade}: {html.escape(str(e))}")
@@ -263,7 +301,7 @@ async def report_now(m: Message):
     try:
         parts = (m.text or "").split()
         offset = int(parts[1]) if len(parts) > 1 else 0
-    except:
+    except Exception:
         offset = 0
     await m.answer("Генерую звіти… ⏳")
     await send_all_brigades_report(offset)
@@ -271,7 +309,7 @@ async def report_now(m: Message):
 
 # ------------------------ Scheduler ----------------------
 def _next_run_dt(now_utc: datetime) -> datetime:
-    """Обчислити найближчу дату/час запуску 19:00 за REPORT_TZ, повернути у UTC."""
+    """Обчислити найближчу дату/час запуску REPORT_TIME за REPORT_TZ, повернути у UTC."""
     hh, mm = map(int, REPORT_TIME.split(":", 1))
     now_local = now_utc.astimezone(REPORT_TZ)
     target_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -283,13 +321,23 @@ async def scheduler_loop():
     log.info("[scheduler] started")
     while True:
         try:
+            # очистимо сторожі минулих днів (на випадок довгого аптайму)
+            day_now = _day_key_in_tz()
+            for k in list(_sent_guard.keys()):
+                if k[1] != day_now:
+                    _sent_guard.pop(k, None)
+
             now_utc = datetime.now(timezone.utc)
             nxt = _next_run_dt(now_utc)
             sleep_sec = (nxt - now_utc).total_seconds()
+            if sleep_sec < 1:
+                sleep_sec = 1
             log.info("[scheduler] next run at %s (%s sec)", nxt.isoformat(), int(sleep_sec))
-            await asyncio.sleep(max(1, sleep_sec))
+            await asyncio.sleep(sleep_sec)
+
             log.info("[scheduler] tick -> sending daily reports")
             await send_all_brigades_report(0)
+            # Далі цикл сам піде на наступну ітерацію і знов «заспить» до завтрашнього часу
         except Exception:
             log.exception("[scheduler] loop error")
             await asyncio.sleep(5)
@@ -306,8 +354,13 @@ async def on_startup():
 
     url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
     await bot.set_webhook(url)
-    asyncio.create_task(scheduler_loop())
     log.info("[startup] webhook set to %s", url)
+
+    if SCHEDULER_ENABLED and LEADER:
+        asyncio.create_task(scheduler_loop())
+        log.info("[scheduler] enabled (LEADER=1)")
+    else:
+        log.info("[scheduler] disabled (SCHEDULER_ENABLED=%s, LEADER=%s)", SCHEDULER_ENABLED, LEADER)
 
 @app.on_event("shutdown")
 async def on_shutdown():
