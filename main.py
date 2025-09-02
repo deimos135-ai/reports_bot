@@ -1,10 +1,10 @@
-# main.py — Fiber "sales" reports-bot (summary only)
-
+# main.py — reports-bot
 import asyncio
 import html
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,6 +15,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import BotCommand, Message, Update
+from aiogram.exceptions import TelegramRetryAfter
 from zoneinfo import ZoneInfo
 
 # ------------------------ Settings ------------------------
@@ -23,20 +24,27 @@ BITRIX_WEBHOOK_BASE = os.environ["BITRIX_WEBHOOK_BASE"].rstrip("/")
 WEBHOOK_BASE = os.environ["WEBHOOK_BASE"].rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "secret")
 
+# TZ та час щоденного звіту
 REPORT_TZ_NAME = os.environ.get("REPORT_TZ", "Europe/Kyiv")
 REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
 REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
-# Куди слати сумарний звіт
-# - REPORT_SUMMARY_CHAT: один чат (int)
-# - або REPORT_CHATS='{"all": -100...}' — fallback
-_raw_report_chats = os.environ.get("REPORT_CHATS", "")
-REPORT_CHATS: Dict[str, int] = json.loads(_raw_report_chats) if _raw_report_chats.strip() else {}
-REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))
+# Увімкнення шедулера та «лідер» (щоб шедулер не дублювався на кількох інстансах)
+SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+LEADER = os.environ.get("LEADER", "0") == "1"
 
-# ENV-переоприділення для стадій кат.0 (не обов’язково)
-CAT0_EXACT_DAY_STAGE_ID = os.environ.get("CAT0_EXACT_DAY_STAGE_ID", "").strip()   # напр. C0:5
-CAT0_THINK_STAGE_ID     = os.environ.get("CAT0_THINK_STAGE_ID", "").strip()       # напр. C0:DETAILS
+# Куди слати: JSON-словник або один chat_id для всіх
+# приклади:
+#   REPORT_CHATS='{"1": -100123, "2": -100124, "3": -100125, "4": -100126, "5": -100127}'
+#   REPORT_CHATS='{"all": -1001234567890}'
+_raw_report_chats = os.environ.get("REPORT_CHATS", "")
+if _raw_report_chats.strip():
+    REPORT_CHATS: Dict[str, int] = json.loads(_raw_report_chats)
+else:
+    REPORT_CHATS = {}
+
+# Якщо хочеш у звіті давати лінки на угоди (не обов'язково):
+B24_DOMAIN = os.environ.get("B24_DOMAIN", "").strip()
 
 # ------------------------ Logging -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -55,39 +63,47 @@ async def healthz():
 
 # ------------------------ Bitrix helpers ------------------
 async def _sleep_backoff(attempt: int, base: float = 0.5, cap: float = 8.0):
-    await asyncio.sleep(min(cap, base * (2 ** attempt)))
+    delay = min(cap, base * (2 ** attempt))
+    await asyncio.sleep(delay)
 
 async def b24(method: str, **params) -> Any:
     url = f"{BITRIX_WEBHOOK_BASE}/{method}.json"
+    # простий ретрай на ліміти/мережеві збої
     for attempt in range(6):
         try:
             async with HTTP.post(url, json=params) as resp:
                 data = await resp.json()
                 if "error" in data:
-                    err = data["error"]; desc = data.get("error_description")
-                    if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS", "INTERNAL_SERVER_ERROR"):
-                        log.warning("Bitrix transient: %s (%s), retry #%s", err, desc, attempt+1)
-                        await _sleep_backoff(attempt); continue
+                    err = data["error"]
+                    desc = data.get("error_description")
+                    # ретраїмо тільки ліміт / тимчасові
+                    if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS"):
+                        log.warning("Bitrix rate-limit: %s (%s), retry #%s", err, desc, attempt + 1)
+                        await _sleep_backoff(attempt)
+                        continue
                     raise RuntimeError(f"B24 error: {err}: {desc}")
                 return data.get("result")
         except aiohttp.ClientError as e:
-            log.warning("Bitrix network error: %s, retry #%s", e, attempt+1)
+            log.warning("Bitrix network error: %s, retry #%s", e, attempt + 1)
             await _sleep_backoff(attempt)
     raise RuntimeError("Bitrix request failed after retries")
 
-async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.15, **params) -> List[Dict[str, Any]]:
+async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.2, **params) -> List[Dict[str, Any]]:
     start = 0
     out: List[Dict[str, Any]] = []
     while True:
-        payload = dict(params); payload["start"] = start
+        payload = dict(params)
+        payload["start"] = start
         res = await b24(method, **payload)
         chunk = res or []
         if isinstance(chunk, dict) and "items" in chunk:
             chunk = chunk.get("items", [])
         out.extend(chunk)
-        if len(chunk) < page_size: break
+        if len(chunk) < page_size:
+            break
         start += page_size
-        if throttle: await asyncio.sleep(throttle)
+        if throttle:
+            await asyncio.sleep(throttle)
     return out
 
 # ------------------------ Caches --------------------------
@@ -100,235 +116,228 @@ async def get_deal_type_map() -> Dict[str, str]:
         log.info("[cache] DEAL_TYPE: %s", len(_DEAL_TYPE_MAP))
     return _DEAL_TYPE_MAP
 
-_CAT_STAGES: Dict[int, List[Dict[str, Any]]] = {}
-async def get_category_stages(cat_id: int) -> List[Dict[str, Any]]:
-    if cat_id not in _CAT_STAGES:
-        st = await b24("crm.dealcategory.stage.list", id=cat_id)
-        _CAT_STAGES[cat_id] = st or []
-        log.info("[cache] CAT%s stages: %s", cat_id, len(_CAT_STAGES[cat_id]))
-    return _CAT_STAGES[cat_id]
+# ------------------------ Classification ------------------
+def normalize_type(type_name: str) -> str:
+    t = (type_name or "").strip().lower()
+    mapping_exact = {
+        "підключення": "connection", "подключение": "connection",
+        "ремонт": "repair",
+        "сервісні роботи": "service", "сервисные работы": "service",
+        "сервіс": "service", "сервис": "service",
+        "перепідключення": "reconnection", "переподключение": "reconnection",
+        "аварія": "accident", "авария": "accident",
+        "роботи по лінії": "linework", "работы по линии": "linework",
+        "не выбран": "other", "не вибрано": "other",
+        "інше": "other", "прочее": "other",
+    }
+    if t in mapping_exact:
+        return mapping_exact[t]
+    # м'які правила
+    if any(k in t for k in ("підключ", "подключ")):
+        return "connection"
+    if "ремонт" in t:
+        return "repair"
+    if any(k in t for k in ("сервіс", "сервис")):
+        return "service"
+    if any(k in t for k in ("перепідключ", "переподключ")):
+        return "reconnection"
+    if "авар" in t:
+        return "accident"
+    if any(k in t for k in ("ліні", "линии")):
+        return "linework"
+    return "other"
+
+REPORT_BUCKETS = [
+    ("connection", "🔌 Підключення"),
+    ("reconnection", "♻️ Перепідключення"),
+    ("repair", "🛠 Ремонти"),
+    ("service", "⚙️ Сервісні роботи"),
+    ("accident", "🚨 Аварії"),
+    ("linework", "📡 Роботи по лінії"),
+    ("other", "📂 Інше"),
+]
+
+# ------------------------ Brigade mapping -----------------
+_BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
+_BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
 
 # ------------------------ Time helpers -------------------
 def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
-    now_local = datetime.now(REPORT_TZ)
-    start_local = (now_local - timedelta(days=offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = start_local + timedelta(days=1)
-    start_utc = start_local.astimezone(timezone.utc)
-    end_utc   = end_local.astimezone(timezone.utc)
-    label = start_local.strftime("%d.%m.%Y")
+    # межі доби за Києвом, конвертовані в UTC ISO
+    now_kyiv = datetime.now(REPORT_TZ)
+    start_kyiv = (now_kyiv - timedelta(days=offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_kyiv = start_kyiv + timedelta(days=1)
+    start_utc = start_kyiv.astimezone(timezone.utc)
+    end_utc = end_kyiv.astimezone(timezone.utc)
+    label = start_kyiv.strftime("%d.%m.%Y")
     return label, start_utc.isoformat(), end_utc.isoformat()
 
-# ------------------------ “Підключення” rules ------------
-# Бригадні стадії (кат.20)
-_BRIGADE_STAGE = {"UC_XF8O6V", "UC_0XLPCN", "UC_204CP3", "UC_TNEW3Z", "UC_RMBZ37"}
+def _day_key_in_tz() -> str:
+    return datetime.now(REPORT_TZ).strftime("%Y-%m-%d")
 
-def _is_connection(type_id: str, type_map: Dict[str, str]) -> bool:
-    name = (type_map.get(type_id or "", "") or "").strip().lower()
-    return "підключ" in name or "подключ" in name
+# ------------------------ Anti-duplicate / rate limiting --
+# (chat_id, day_key, brigade) -> True (вже відправлено сьогодні)
+_sent_guard: Dict[Tuple[int, str, int], bool] = {}
+# останній час відправки в конкретний чат (секунди time.time())
+_last_chat_send_ts: Dict[int, float] = {}
+_CHAT_MIN_INTERVAL_SEC = 5  # мʼякий тротлінг: не частіше 1 повідомлення/5с у чат
 
-# ------------------------ CAT0 exact-day / think ----------
-def _stage_code(cat_id: int, status_id: str) -> str:
-    return f"C{cat_id}:{status_id}"
-
-async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
-    """Повертає (C0:5, C0:DETAILS) з ENV або з довідника Bitrix."""
-    exact_day = CAT0_EXACT_DAY_STAGE_ID
-    think     = CAT0_THINK_STAGE_ID
-    if exact_day and think:
-        return exact_day, think
-
-    stages = await get_category_stages(0)
-    sid_exact = None
-    sid_think = None
-    for s in stages:
-        sid = s.get("STATUS_ID", "")
-        nm  = (s.get("NAME", "") or "").lower()
-        if sid == "5" or "конкретний день" in nm:
-            sid_exact = sid
-        if sid == "DETAILS" or "дума" in nm:
-            sid_think = sid
-    # fallback до відомих значень
-    sid_exact = sid_exact or "5"
-    sid_think = sid_think or "DETAILS"
-    return _stage_code(0, sid_exact), _stage_code(0, sid_think)
-
-# ------------------------ Company summary -----------------
-async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
+# ------------------------ Report core --------------------
+async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], int]:
     label, frm, to = _day_bounds(offset_days)
-    type_map = await get_deal_type_map()
+    deal_type_map = await get_deal_type_map()
 
-    # 1) Підключення — подали сьогодні (кат.20)
-    created_cat20 = await b24_list(
-        "crm.deal.list",
-        order={"ID": "DESC"},
-        filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 20},
-        select=["ID", "TYPE_ID"],
-    )
-    conn_created = sum(1 for d in created_cat20 if _is_connection(d.get("TYPE_ID"), type_map))
+    exec_opt = _BRIGADE_EXEC_OPTION_ID.get(brigade)
+    filter_closed = {"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to}
+    if exec_opt:
+        filter_closed["UF_CRM_1611995532420"] = exec_opt
 
-    # 2) Підключення — закрили сьогодні (кат.20 → WON)
-    closed_cat20 = await b24_list(
+    closed = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
-        filter={"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
+        filter=filter_closed,
         select=["ID", "TYPE_ID"],
+        page_size=200,
     )
-    conn_closed = sum(1 for d in closed_cat20 if _is_connection(d.get("TYPE_ID"), type_map))
 
-    # 3) Підключення — активні на бригадах (кат.20, відкриті, стадія ∈ бригадні)
-    brigade_stage_ids = {f"C20:{x}" for x in _BRIGADE_STAGE}
-    open_cat20 = await b24_list(
+    counts = {k: 0 for k, _ in REPORT_BUCKETS}
+    for d in closed:
+        tcode = d.get("TYPE_ID") or ""
+        tname = deal_type_map.get(tcode, tcode)
+        cls = normalize_type(tname)
+        counts[cls] = counts.get(cls, 0) + 1
+
+    stage_code = _BRIGADE_STAGE[brigade]
+    active = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
-        filter={"CLOSED": "N", "CATEGORY_ID": 20},
-        select=["ID", "TYPE_ID", "STAGE_ID"],
-    )
-    conn_active = sum(
-        1 for d in open_cat20
-        if (d.get("STAGE_ID") in brigade_stage_ids and _is_connection(d.get("TYPE_ID"), type_map))
-    )
-
-    # 4) Категорія 0 — «На конкретний день» та «Думають» (поточні відкриті)
-    c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
-
-    # «На конкретний день»
-    cat0_exact = await b24_list(
-        "crm.deal.list",
-        order={"ID": "DESC"},
-        filter={"CLOSED": "N", "CATEGORY_ID": 0, "STAGE_ID": c0_exact_stage},
+        filter={"CLOSED": "N", "STAGE_ID": f"C20:{stage_code}"},
         select=["ID"],
+        page_size=200,
     )
-    # «Думають»
-    cat0_think = await b24_list(
-        "crm.deal.list",
-        order={"ID": "DESC"},
-        filter={"CLOSED": "N", "CATEGORY_ID": 0, "STAGE_ID": c0_think_stage},
-        select=["ID"],
-    )
+    return label, counts, len(active)
 
-    return {
-        "date_label": label,
-        "connections": {
-            "created": conn_created,
-            "closed":  conn_closed,
-            "active":  conn_active,
-        },
-        "cat0": {
-            "exact_day": len(cat0_exact),
-            "think":     len(cat0_think),
-        },
-    }
-
-def format_company_summary(d: Dict[str, Any]) -> str:
-    dl = d["date_label"]
-    c  = d["connections"]
-    k0 = d["cat0"]
+def format_report(brigade: int, date_label: str, counts: Dict[str, int], active_left: int) -> str:
+    total = sum(counts.values())
     lines = [
-        f"🗓 <b>Дата: {dl}</b>",
+        f"📝 <b>Звіт по бригаді №{brigade} — {date_label}</b>",
         "",
-        "📌 <b>Підключення</b>",
-        f"Всього подали (кат.20) — <b>{c['created']}</b>",
-        f"Закрили сьогодні (кат.20) — <b>{c['closed']}</b>",
-        f"Активних на бригадах (кат.20) — <b>{c['active']}</b>",
+        f"✅ <b>Закрито задач:</b> {total}",
         "",
-        f"На конкретний день (кат.0) — <b>{k0['exact_day']}</b>",
-        f"Думають (кат.0) — <b>{k0['think']}</b>",
+    ]
+    for key, title in REPORT_BUCKETS:
+        lines.append(f"{title}: {counts.get(key, 0)}")
+    lines += [
+        "",
+        f"📊 <b>Активних задач залишилось:</b> {active_left}",
     ]
     return "\n".join(lines)
 
-# ------------------------ Utilities -----------------------
-def _pad(s: str, n: int) -> str:
-    s = str(s or ""); return s + " " * max(0, n - len(s))
-
-async def render_category_stages_table(cat_id: int) -> str:
-    stages = await get_category_stages(cat_id)
-    rows = [(s.get("STATUS_ID", ""), s.get("NAME", "")) for s in stages]
-    w_id = max([len("STATUS_ID")] + [len(x[0]) for x in rows]) + 2
-    w_nm = max([len("NAME")] + [len(x[1]) for x in rows]) + 2
-    out = []
-    out.append(f"Категорія: {cat_id}\n")
-    out.append("<code>")
-    out.append(_pad("STATUS_ID", w_id) + _pad("NAME", w_nm))
-    out.append(_pad("-" * len("STATUS_ID"), w_id) + _pad("-" * len("NAME"), w_nm))
-    for sid, name in rows: out.append(_pad(sid, w_id) + _pad(name, w_nm))
-    out.append("</code>")
-    return "\n".join(out)
-
-def _resolve_summary_chat() -> Optional[int]:
-    if REPORT_SUMMARY_CHAT: return REPORT_SUMMARY_CHAT
-    if "all" in REPORT_CHATS: return int(REPORT_CHATS["all"])
-    return None
-
 async def _safe_send(chat_id: int, text: str):
-    for attempt in range(5):
+    # мʼякий тротлінг по чату
+    now = time.time()
+    last = _last_chat_send_ts.get(chat_id, 0.0)
+    gap = _CHAT_MIN_INTERVAL_SEC - (now - last)
+    if gap > 0:
+        await asyncio.sleep(gap)
+
+    for attempt in range(3):
         try:
             await bot.send_message(chat_id, text, disable_web_page_preview=True)
+            _last_chat_send_ts[chat_id] = time.time()
             return
+        except TelegramRetryAfter as e:
+            retry_after = int(getattr(e, "retry_after", 15))
+            log.warning("telegram 429 in chat %s, retry_after=%s (attempt %s)", chat_id, retry_after, attempt + 1)
+            await asyncio.sleep(retry_after)
         except Exception as e:
-            log.warning("telegram send failed: %s, retry #%s", e, attempt+1)
-            await _sleep_backoff(attempt)
-    log.error("telegram send failed permanently")
+            log.warning("telegram send failed: %s, retry #%s", e, attempt + 1)
+            await asyncio.sleep(2 + attempt * 2)
+    log.error("telegram send failed permanently (chat %s)", chat_id)
 
-async def send_company_summary(offset_days: int = 0) -> None:
-    chat_id = _resolve_summary_chat()
-    if not chat_id:
-        log.warning("No REPORT_SUMMARY_CHAT nor REPORT_CHATS['all'] configured")
-        return
+async def _send_one_brigade_report(brigade: int, chat_id: int, offset_days: int) -> None:
     try:
-        data = await build_company_summary(offset_days)
-        await _safe_send(chat_id, format_company_summary(data))
-    except Exception:
-        log.exception("company summary failed")
-        await _safe_send(chat_id, "❗️Помилка формування сумарного звіту")
+        day_key = _day_key_in_tz()
+        guard_key = (chat_id, day_key, brigade)
 
-# ------------------------ Commands -----------------------
+        # Ідемпотентність: за сьогодні в цей чат по цій бригаді — тільки раз
+        if offset_days == 0 and _sent_guard.get(guard_key):
+            log.info("Skip duplicate: chat=%s day=%s brigade=%s", chat_id, day_key, brigade)
+            return
+
+        label, counts, active_left = await build_daily_report(brigade, offset_days)
+        await _safe_send(chat_id, format_report(brigade, label, counts, active_left))
+
+        if offset_days == 0:
+            _sent_guard[guard_key] = True
+    except Exception as e:
+        log.exception("Report for brigade %s failed", brigade)
+        await _safe_send(chat_id, f"❗️Помилка формування звіту для бригади №{brigade}: {html.escape(str(e))}")
+
+def _resolve_chat_for_brigade(b: int) -> Optional[int]:
+    # спершу точна бригада "1".."5", далі "all"
+    if str(b) in REPORT_CHATS:
+        return int(REPORT_CHATS[str(b)])
+    if b in REPORT_CHATS:  # якщо раптом передали як int у JSON
+        return int(REPORT_CHATS[b])
+    if "all" in REPORT_CHATS:
+        return int(REPORT_CHATS["all"])
+    return None
+
+async def send_all_brigades_report(offset_days: int = 0) -> None:
+    tasks = []
+    for b in (1, 2, 3, 4, 5):
+        chat_id = _resolve_chat_for_brigade(b)
+        if not chat_id:
+            log.warning("No chat configured for brigade %s", b)
+            continue
+        tasks.append(_send_one_brigade_report(b, chat_id, offset_days))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+# ------------------------ Manual command -----------------
 @dp.message(Command("report_now"))
 async def report_now(m: Message):
-    # /report_now         — за сьогодні
-    # /report_now 1       — за вчора
-    parts = (m.text or "").split()
     try:
+        parts = (m.text or "").split()
         offset = int(parts[1]) if len(parts) > 1 else 0
-    except ValueError:
+    except Exception:
         offset = 0
-    await m.answer("🔄 Формую сумарний звіт…")
-    await send_company_summary(offset)
-    await m.answer("✅ Готово")
-
-@dp.message(Command("cat_stages"))
-async def cmd_cat_stages(m: Message):
-    parts = (m.text or "").split()
-    try:
-        cat_id = int(parts[1]) if len(parts) > 1 else 0
-    except ValueError:
-        cat_id = 0
-    await m.answer("🔎 Збираю стадії категорії…")
-    try:
-        text = await render_category_stages_table(cat_id)
-        await m.answer(text)
-    except Exception as e:
-        log.exception("cat_stages failed")
-        await m.answer(f"❗️Помилка завантаження стадій: {html.escape(str(e))}")
+    await m.answer("Генерую звіти… ⏳")
+    await send_all_brigades_report(offset)
+    await m.answer("Готово ✅")
 
 # ------------------------ Scheduler ----------------------
 def _next_run_dt(now_utc: datetime) -> datetime:
+    """Обчислити найближчу дату/час запуску REPORT_TIME за REPORT_TZ, повернути у UTC."""
     hh, mm = map(int, REPORT_TIME.split(":", 1))
     now_local = now_utc.astimezone(REPORT_TZ)
     target_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    if target_local <= now_local: target_local += timedelta(days=1)
+    if target_local <= now_local:
+        target_local = target_local + timedelta(days=1)
     return target_local.astimezone(timezone.utc)
 
 async def scheduler_loop():
     log.info("[scheduler] started")
     while True:
         try:
+            # очистимо сторожі минулих днів (на випадок довгого аптайму)
+            day_now = _day_key_in_tz()
+            for k in list(_sent_guard.keys()):
+                if k[1] != day_now:
+                    _sent_guard.pop(k, None)
+
             now_utc = datetime.now(timezone.utc)
             nxt = _next_run_dt(now_utc)
-            sleep_sec = max(1, (nxt - now_utc).total_seconds())
-            log.info("[scheduler] next run at %s in %ss", nxt.isoformat(), int(sleep_sec))
+            sleep_sec = (nxt - now_utc).total_seconds()
+            if sleep_sec < 1:
+                sleep_sec = 1
+            log.info("[scheduler] next run at %s (%s sec)", nxt.isoformat(), int(sleep_sec))
             await asyncio.sleep(sleep_sec)
-            log.info("[scheduler] tick -> sending summary")
-            await send_company_summary(0)
+
+            log.info("[scheduler] tick -> sending daily reports")
+            await send_all_brigades_report(0)
+            # Далі цикл сам піде на наступну ітерацію і знов «заспить» до завтрашнього часу
         except Exception:
             log.exception("[scheduler] loop error")
             await asyncio.sleep(5)
@@ -338,14 +347,20 @@ async def scheduler_loop():
 async def on_startup():
     global HTTP
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+
     await bot.set_my_commands([
-        BotCommand(command="report_now", description="Ручний запуск сумарного звіту (/report_now [offset])"),
-        BotCommand(command="cat_stages", description="Показати стадії категорії (/cat_stages [id])"),
+        BotCommand(command="report_now", description="Ручний запуск звітів (/report_now [offset])"),
     ])
+
     url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
     await bot.set_webhook(url)
-    asyncio.create_task(scheduler_loop())
     log.info("[startup] webhook set to %s", url)
+
+    if SCHEDULER_ENABLED and LEADER:
+        asyncio.create_task(scheduler_loop())
+        log.info("[scheduler] enabled (LEADER=1)")
+    else:
+        log.info("[scheduler] disabled (SCHEDULER_ENABLED=%s, LEADER=%s)", SCHEDULER_ENABLED, LEADER)
 
 @app.on_event("shutdown")
 async def on_shutdown():
