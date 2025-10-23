@@ -1,4 +1,4 @@
-# main.py — reports-bot (UPDATED)
+# main.py — reports-bot (FULL UPDATED)
 import asyncio
 import html
 import json
@@ -37,11 +37,24 @@ LEADER = os.environ.get("LEADER", "0") == "1"
 # приклади:
 #   REPORT_CHATS='{"1": -100123, "2": -100124, "3": -100125, "4": -100126, "5": -100127}'
 #   REPORT_CHATS='{"all": -1001234567890}'
+#   REPORT_CHATS='-1001234567890'  # <- теж ок, один чат для всіх
 _raw_report_chats = os.environ.get("REPORT_CHATS", "")
 if _raw_report_chats.strip():
-    REPORT_CHATS: Dict[str, int] = json.loads(_raw_report_chats)
+    try:
+        parsed = json.loads(_raw_report_chats)
+    except Exception:
+        parsed = _raw_report_chats.strip()
+    # Нормалізація у словник
+    if isinstance(parsed, dict):
+        REPORT_CHATS: Any = {str(k): int(v) for k, v in parsed.items()}
+    elif isinstance(parsed, int):
+        REPORT_CHATS: Any = {"all": parsed}
+    elif isinstance(parsed, str) and parsed.lstrip("-").isdigit():
+        REPORT_CHATS: Any = {"all": int(parsed)}
+    else:
+        REPORT_CHATS: Any = {}
 else:
-    REPORT_CHATS = {}
+    REPORT_CHATS: Any = {}
 
 # Якщо хочеш у звіті давати лінки на угоди (не обов'язково):
 B24_DOMAIN = os.environ.get("B24_DOMAIN", "").strip()
@@ -175,7 +188,7 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
 def _day_key_in_tz() -> str:
     return datetime.now(REPORT_TZ).strftime("%Y-%m-%d")
 
-# ------------------------ NEW: Bitrix datetime parser (UPDATED) -------------------
+# ------------------------ Bitrix datetime parser -------------------
 def _parse_b24_dt(s: Optional[str]) -> Optional[datetime]:
     """Безпечно парсимо ISO-дату з Bitrix у aware datetime."""
     if not s:
@@ -196,7 +209,6 @@ _last_chat_send_ts: Dict[int, float] = {}
 _CHAT_MIN_INTERVAL_SEC = 5  # мʼякий тротлінг: не частіше 1 повідомлення/5с у чат
 
 # ------------------------ Report core --------------------
-# UPDATED: повертаємо закриті_по_категоріях, активні_по_категоріях, і к-сть «ремонтів >24 год»
 async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], Dict[str, int], int]:
     """
     Повертає: (мітка дати, closed_counts_by_category, active_counts_by_category, overdue_repairs_24h)
@@ -204,7 +216,7 @@ async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[
     label, frm, to = _day_bounds(offset_days)
     deal_type_map = await get_deal_type_map()
 
-    # --- Закриті за добу (як було)
+    # --- Закриті за добу
     exec_opt = _BRIGADE_EXEC_OPTION_ID.get(brigade)
     filter_closed = {"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to}
     if exec_opt:
@@ -225,7 +237,7 @@ async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[
         cls = normalize_type(tname)
         closed_counts[cls] = closed_counts.get(cls, 0) + 1
 
-    # --- Активні у стадії бригади: тягнемо TYPE_ID і DATE_CREATE (для SLA 24h)
+    # --- Активні у стадії бригади (для SLA 24h беремо DATE_CREATE)
     stage_code = _BRIGADE_STAGE[brigade]
     active = await b24_list(
         "crm.deal.list",
@@ -254,7 +266,6 @@ async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[
 
     return label, closed_counts, active_counts, overdue_repairs_24h
 
-# UPDATED: формат — додаємо блок активних + підсвітку емодзі при просрочених ремонтах
 def format_report(
     brigade: int,
     date_label: str,
@@ -310,7 +321,34 @@ async def _safe_send(chat_id: int, text: str):
             await asyncio.sleep(2 + attempt * 2)
     log.error("telegram send failed permanently (chat %s)", chat_id)
 
-# UPDATED: під нові повернення build_daily_report / format_report
+def _resolve_chat_for_brigade(b: int) -> Optional[int]:
+    """
+    Підтримує обидва формати:
+    - dict: {"1": chat_id, "2": chat_id, ..., "all": chat_id}
+    - int (або рядок-цифра): один chat_id для всіх (нормалізується вище у {"all": chat_id})
+    """
+    # На випадок якщо хтось ще таки поклав int у REPORT_CHATS напряму
+    if isinstance(REPORT_CHATS, int):
+        return REPORT_CHATS
+
+    if not isinstance(REPORT_CHATS, dict):
+        return None
+
+    key = str(b)
+    if key in REPORT_CHATS:
+        try:
+            return int(REPORT_CHATS[key])
+        except Exception:
+            return None
+
+    if "all" in REPORT_CHATS:
+        try:
+            return int(REPORT_CHATS["all"])
+        except Exception:
+            return None
+
+    return None
+
 async def _send_one_brigade_report(brigade: int, chat_id: int, offset_days: int) -> None:
     try:
         day_key = _day_key_in_tz()
@@ -329,16 +367,6 @@ async def _send_one_brigade_report(brigade: int, chat_id: int, offset_days: int)
     except Exception as e:
         log.exception("Report for brigade %s failed", brigade)
         await _safe_send(chat_id, f"❗️Помилка формування звіту для бригади №{brigade}: {html.escape(str(e))}")
-
-def _resolve_chat_for_brigade(b: int) -> Optional[int]:
-    # спершу точна бригада "1".."5", далі "all"
-    if str(b) in REPORT_CHATS:
-        return int(REPORT_CHATS[str(b)])
-    if b in REPORT_CHATS:  # якщо раптом передали як int у JSON
-        return int(REPORT_CHATS[b])
-    if "all" in REPORT_CHATS:
-        return int(REPORT_CHATS["all"])
-    return None
 
 async def send_all_brigades_report(offset_days: int = 0) -> None:
     tasks = []
