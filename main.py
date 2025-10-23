@@ -1,4 +1,4 @@
-# main.py — reports-bot
+# main.py — reports-bot (UPDATED)
 import asyncio
 import html
 import json
@@ -175,6 +175,19 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
 def _day_key_in_tz() -> str:
     return datetime.now(REPORT_TZ).strftime("%Y-%m-%d")
 
+# ------------------------ NEW: Bitrix datetime parser (UPDATED) -------------------
+def _parse_b24_dt(s: Optional[str]) -> Optional[datetime]:
+    """Безпечно парсимо ISO-дату з Bitrix у aware datetime."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z")
+        except Exception:
+            return None
+
 # ------------------------ Anti-duplicate / rate limiting --
 # (chat_id, day_key, brigade) -> True (вже відправлено сьогодні)
 _sent_guard: Dict[Tuple[int, str, int], bool] = {}
@@ -183,10 +196,15 @@ _last_chat_send_ts: Dict[int, float] = {}
 _CHAT_MIN_INTERVAL_SEC = 5  # мʼякий тротлінг: не частіше 1 повідомлення/5с у чат
 
 # ------------------------ Report core --------------------
-async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], int]:
+# UPDATED: повертаємо закриті_по_категоріях, активні_по_категоріях, і к-сть «ремонтів >24 год»
+async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], Dict[str, int], int]:
+    """
+    Повертає: (мітка дати, closed_counts_by_category, active_counts_by_category, overdue_repairs_24h)
+    """
     label, frm, to = _day_bounds(offset_days)
     deal_type_map = await get_deal_type_map()
 
+    # --- Закриті за добу (як було)
     exec_opt = _BRIGADE_EXEC_OPTION_ID.get(brigade)
     filter_closed = {"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to}
     if exec_opt:
@@ -200,37 +218,74 @@ async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[
         page_size=200,
     )
 
-    counts = {k: 0 for k, _ in REPORT_BUCKETS}
+    closed_counts = {k: 0 for k, _ in REPORT_BUCKETS}
     for d in closed:
         tcode = d.get("TYPE_ID") or ""
         tname = deal_type_map.get(tcode, tcode)
         cls = normalize_type(tname)
-        counts[cls] = counts.get(cls, 0) + 1
+        closed_counts[cls] = closed_counts.get(cls, 0) + 1
 
+    # --- Активні у стадії бригади: тягнемо TYPE_ID і DATE_CREATE (для SLA 24h)
     stage_code = _BRIGADE_STAGE[brigade]
     active = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
         filter={"CLOSED": "N", "STAGE_ID": f"C20:{stage_code}"},
-        select=["ID"],
+        select=["ID", "TYPE_ID", "DATE_CREATE"],
         page_size=200,
     )
-    return label, counts, len(active)
 
-def format_report(brigade: int, date_label: str, counts: Dict[str, int], active_left: int) -> str:
-    total = sum(counts.values())
+    active_counts = {k: 0 for k, _ in REPORT_BUCKETS}
+    overdue_repairs_24h = 0
+
+    now_utc = datetime.now(timezone.utc)
+    for d in active:
+        tcode = d.get("TYPE_ID") or ""
+        tname = deal_type_map.get(tcode, tcode)
+        cls = normalize_type(tname)
+        active_counts[cls] = active_counts.get(cls, 0) + 1
+
+        if cls == "repair":
+            created = _parse_b24_dt(d.get("DATE_CREATE"))
+            if created:
+                age = now_utc - created.astimezone(timezone.utc)
+                if age > timedelta(hours=24):
+                    overdue_repairs_24h += 1
+
+    return label, closed_counts, active_counts, overdue_repairs_24h
+
+# UPDATED: формат — додаємо блок активних + підсвітку емодзі при просрочених ремонтах
+def format_report(
+    brigade: int,
+    date_label: str,
+    closed_counts: Dict[str, int],
+    active_counts: Dict[str, int],
+    overdue_repairs_24h: int,
+) -> str:
+    closed_total = sum(closed_counts.values())
+    active_total = sum(active_counts.values())
+    warn_emoji = "⚠️" if overdue_repairs_24h > 0 else "🕒"
+
     lines = [
         f"📝 <b>Звіт по бригаді №{brigade} — {date_label}</b>",
         "",
-        f"✅ <b>Закрито задач:</b> {total}",
-        "",
+        f"✅ <b>Закрито задач:</b> {closed_total}",
     ]
     for key, title in REPORT_BUCKETS:
-        lines.append(f"{title}: {counts.get(key, 0)}")
+        lines.append(f"{title}: {closed_counts.get(key, 0)}")
+
     lines += [
         "",
-        f"📊 <b>Активних задач залишилось:</b> {active_left}",
+        f"📊 <b>Активні задачі (усього):</b> {active_total}",
     ]
+    for key, title in REPORT_BUCKETS:
+        lines.append(f"{title}: {active_counts.get(key, 0)}")
+
+    lines += [
+        "",
+        f"{warn_emoji} <b>Ремонтів відкритих понад 24 години:</b> {overdue_repairs_24h}",
+    ]
+
     return "\n".join(lines)
 
 async def _safe_send(chat_id: int, text: str):
@@ -255,6 +310,7 @@ async def _safe_send(chat_id: int, text: str):
             await asyncio.sleep(2 + attempt * 2)
     log.error("telegram send failed permanently (chat %s)", chat_id)
 
+# UPDATED: під нові повернення build_daily_report / format_report
 async def _send_one_brigade_report(brigade: int, chat_id: int, offset_days: int) -> None:
     try:
         day_key = _day_key_in_tz()
@@ -265,8 +321,8 @@ async def _send_one_brigade_report(brigade: int, chat_id: int, offset_days: int)
             log.info("Skip duplicate: chat=%s day=%s brigade=%s", chat_id, day_key, brigade)
             return
 
-        label, counts, active_left = await build_daily_report(brigade, offset_days)
-        await _safe_send(chat_id, format_report(brigade, label, counts, active_left))
+        label, closed_counts, active_counts, overdue_repairs_24h = await build_daily_report(brigade, offset_days)
+        await _safe_send(chat_id, format_report(brigade, label, closed_counts, active_counts, overdue_repairs_24h))
 
         if offset_days == 0:
             _sent_guard[guard_key] = True
