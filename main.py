@@ -1,4 +1,4 @@
-# main.py — reports-bot (v3 with AI daily summary)
+# main.py — reports-bot (v4 all-in-one)
 import asyncio
 import html
 import json
@@ -34,7 +34,7 @@ LEADER = os.environ.get("LEADER", "0") == "1"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 AI_SUMMARY_ENABLED = os.environ.get("AI_SUMMARY_ENABLED", "true").lower() in ("1", "true", "yes", "y")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 
 _raw_report_chats = os.environ.get("REPORT_CHATS", "")
 
@@ -87,8 +87,6 @@ def _normalize_report_chats(raw: str) -> Dict[str, Any]:
 
 REPORT_CHATS: Dict[str, Any] = _normalize_report_chats(_raw_report_chats)
 
-B24_DOMAIN = os.environ.get("B24_DOMAIN", "").strip()
-
 # ------------------------ Logging -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("report_bot")
@@ -98,7 +96,16 @@ app = FastAPI()
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 HTTP: aiohttp.ClientSession
-OA_CLIENT: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+OA_CLIENT: Optional[OpenAI] = (
+    OpenAI(
+        api_key=OPENAI_API_KEY,
+        timeout=20.0,
+        max_retries=2,
+    )
+    if OPENAI_API_KEY
+    else None
+)
 
 # ------------------------ Health --------------------------
 @app.get("/healthz")
@@ -273,6 +280,14 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
 def _day_key_in_tz(offset_days: int = 0) -> str:
     return (datetime.now(REPORT_TZ) - timedelta(days=offset_days)).strftime("%Y-%m-%d")
 
+
+def _is_evening_report() -> bool:
+    try:
+        hh, _mm = map(int, REPORT_TIME.split(":", 1))
+        return hh >= 18
+    except Exception:
+        return False
+
 # ------------------------ Bitrix datetime parser ----------
 def _parse_b24_dt(s: Optional[str]) -> Optional[datetime]:
     if not s:
@@ -327,8 +342,13 @@ async def build_ai_summary(report_rows: List[Dict[str, Any]]) -> Optional[str]:
         default=None,
     )
 
+    best_connection = max(report_rows, key=lambda r: int(r["closed_counts"].get("connection", 0)), default=None)
+    best_repair = max(report_rows, key=lambda r: int(r["closed_counts"].get("repair", 0)), default=None)
+    most_overdue = max(report_rows, key=lambda r: int(r["overdue_repairs_24h"]), default=None)
+
     payload = {
         "date": report_rows[0]["date_label"],
+        "is_evening": _is_evening_report(),
         "totals": {
             "closed_total": sum(total_closed.values()),
             "active_total": sum(total_active.values()),
@@ -348,23 +368,37 @@ async def build_ai_summary(report_rows: List[Dict[str, Any]]) -> Optional[str]:
             }
             for r in report_rows
         ],
-        "best_brigade": {
-            "brigade": best_brigade["brigade"],
-            "title": _BRIGADE_TITLE.get(best_brigade["brigade"], f"Бригада №{best_brigade['brigade']}"),
-            "closed_total": sum(best_brigade["closed_counts"].values()),
-        } if best_brigade else None,
+        "leaders": {
+            "best_overall": {
+                "title": _BRIGADE_TITLE.get(best_brigade["brigade"], f"Бригада №{best_brigade['brigade']}"),
+                "closed_total": sum(best_brigade["closed_counts"].values()),
+            } if best_brigade else None,
+            "best_connection": {
+                "title": _BRIGADE_TITLE.get(best_connection["brigade"], f"Бригада №{best_connection['brigade']}"),
+                "count": int(best_connection["closed_counts"].get("connection", 0)),
+            } if best_connection else None,
+            "best_repair": {
+                "title": _BRIGADE_TITLE.get(best_repair["brigade"], f"Бригада №{best_repair['brigade']}"),
+                "count": int(best_repair["closed_counts"].get("repair", 0)),
+            } if best_repair else None,
+            "most_overdue": {
+                "title": _BRIGADE_TITLE.get(most_overdue["brigade"], f"Бригада №{most_overdue['brigade']}"),
+                "count": int(most_overdue["overdue_repairs_24h"]),
+            } if most_overdue else None,
+        },
     }
 
     instructions = (
         "Ти аналітик сервісної служби. "
         "Напиши короткий підсумок українською для Telegram на основі JSON. "
         "Не вигадуй числа, використовуй тільки ті, що є в JSON. "
-        "Стиль дружній, 5-8 рядків. "
+        "Стиль дружній, теплий, діловий, 5-8 рядків. "
         "Скажи загальний результат дня, основні типи виконаних робіт, "
-        "відзнач найкращу бригаду. "
-        "Якщо є відкриті ремонти понад 24 години — коротко згадай це. "
+        "відзнач бригаду дня, окремо можеш похвалити лідера по підключеннях або ремонтах, якщо це доречно. "
+        "Якщо є відкриті ремонти понад 24 години — коротко згадай це без драматизації. "
         "Можна використовувати HTML теги <b>. "
-        "Без списків з тире. Без хештегів. Без вигаданих причин."
+        "Без списків з тире. Без хештегів. Без вигаданих причин. "
+        "Якщо is_evening=true, у фіналі додай коротке людяне побажання гарного вечора команді."
     )
 
     def _call_openai() -> str:
@@ -373,13 +407,84 @@ async def build_ai_summary(report_rows: List[Dict[str, Any]]) -> Optional[str]:
             instructions=instructions,
             input=json.dumps(payload, ensure_ascii=False),
         )
-        return response.output_text.strip()
+        text = (response.output_text or "").strip()
+        if not text:
+            raise RuntimeError("Empty AI response")
+        return text
 
     try:
         return await asyncio.to_thread(_call_openai)
-    except Exception as e:
-        log.warning("AI summary failed: %s", e)
+    except Exception:
+        log.exception("AI summary failed")
         return None
+
+
+def build_plain_summary(report_rows: List[Dict[str, Any]]) -> str:
+    total_closed = _sum_bucket_counts([r["closed_counts"] for r in report_rows])
+    total_active = _sum_bucket_counts([r["active_counts"] for r in report_rows])
+    total_overdue = sum(int(r["overdue_repairs_24h"]) for r in report_rows)
+
+    best_brigade = max(
+        report_rows,
+        key=lambda r: sum(r["closed_counts"].values()),
+        default=None,
+    )
+    best_connection = max(report_rows, key=lambda r: int(r["closed_counts"].get("connection", 0)), default=None)
+    best_repair = max(report_rows, key=lambda r: int(r["closed_counts"].get("repair", 0)), default=None)
+
+    best_title = (
+        _BRIGADE_TITLE.get(best_brigade["brigade"], f"Бригада №{best_brigade['brigade']}")
+        if best_brigade else "—"
+    )
+    conn_title = (
+        _BRIGADE_TITLE.get(best_connection["brigade"], f"Бригада №{best_connection['brigade']}")
+        if best_connection else "—"
+    )
+    repair_title = (
+        _BRIGADE_TITLE.get(best_repair["brigade"], f"Бригада №{best_repair['brigade']}")
+        if best_repair else "—"
+    )
+
+    lines = [
+        f"<b>Загалом за день закрито:</b> {sum(total_closed.values())}",
+        f"🔌 Підключення: {total_closed['connection']}",
+        f"♻️ Перепідключення: {total_closed['reconnection']}",
+        f"🛠 Ремонти: {total_closed['repair']}",
+        f"⚙️ Сервісні роботи: {total_closed['service']}",
+        f"🚨 Аварії: {total_closed['accident']}",
+        f"📡 Роботи по лінії: {total_closed['linework']}",
+        f"📂 Інше: {total_closed['other']}",
+        "",
+        f"<b>Бригада дня:</b> {best_title}",
+        f"<b>Лідер по підключеннях:</b> {conn_title}",
+        f"<b>Лідер по ремонтах:</b> {repair_title}",
+        f"<b>Активних задач:</b> {sum(total_active.values())}",
+        f"<b>Ремонтів понад 24 години:</b> {total_overdue}",
+    ]
+
+    if _is_evening_report():
+        lines += ["", "Гарного вечора команді 😊"]
+
+    return "\n".join(lines)
+
+
+async def _send_ai_summary_after_reports(report_rows: List[Dict[str, Any]]) -> None:
+    if not report_rows:
+        return
+
+    try:
+        ai_text = await build_ai_summary(report_rows)
+        if not ai_text:
+            ai_text = build_plain_summary(report_rows)
+
+        first = report_rows[0]
+        await _safe_send(
+            first["chat_id"],
+            f"🤖 <b>Підсумок дня</b>\n\n{ai_text}",
+            thread_id=first["thread_id"],
+        )
+    except Exception:
+        log.exception("Sending AI/fallback summary failed")
 
 # ------------------------ Report core ---------------------
 async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], Dict[str, int], int]:
@@ -613,14 +718,7 @@ async def send_all_brigades_report(offset_days: int = 0) -> None:
             report_rows.append(r)
 
     if report_rows:
-        ai_text = await build_ai_summary(report_rows)
-        if ai_text:
-            first = report_rows[0]
-            await _safe_send(
-                first["chat_id"],
-                f"🤖 <b>Підсумок дня від AI</b>\n\n{ai_text}",
-                thread_id=first["thread_id"],
-            )
+        asyncio.create_task(_send_ai_summary_after_reports(report_rows))
 
 # ------------------------ Manual commands -----------------
 @dp.message(Command("report_now"))
