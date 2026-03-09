@@ -1,4 +1,4 @@
-# main.py — reports-bot (FULL UPDATED)
+# main.py — reports-bot (FULL UPDATED, forum topics support)
 import asyncio
 import html
 import json
@@ -33,28 +33,83 @@ REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "true").lower() in ("1", "true", "yes", "y")
 LEADER = os.environ.get("LEADER", "0") == "1"
 
-# Куди слати: JSON-словник або один chat_id для всіх
-# приклади:
-#   REPORT_CHATS='{"1": -100123, "2": -100124, "3": -100125, "4": -100126, "5": -100127}'
-#   REPORT_CHATS='{"all": -1001234567890}'
-#   REPORT_CHATS='-1001234567890'  # <- теж ок, один чат для всіх
+# REPORT_CHATS підтримує формати:
+# 1) Старий формат — один chat_id для всіх:
+#    REPORT_CHATS='-1001234567890'
+#
+# 2) Старий формат — словник chat_id:
+#    REPORT_CHATS='{"1": -100123, "2": -100124, "3": -100125, "4": -100126, "5": -100127}'
+#
+# 3) Новий формат — forum topics:
+#    REPORT_CHATS='{
+#      "1": {"chat_id": -1003598162178, "thread_id": 5},
+#      "2": {"chat_id": -1003598162178, "thread_id": 6},
+#      "3": {"chat_id": -1003598162178, "thread_id": 7},
+#      "4": {"chat_id": -1003598162178, "thread_id": 8},
+#      "5": {"chat_id": -1003598162178, "thread_id": 9}
+#    }'
+#
+# 4) Один target для всіх:
+#    REPORT_CHATS='{"all": {"chat_id": -1003598162178, "thread_id": 5}}'
+#
+# 5) all без thread_id:
+#    REPORT_CHATS='{"all": -1001234567890}'
+
 _raw_report_chats = os.environ.get("REPORT_CHATS", "")
-if _raw_report_chats.strip():
+
+def _normalize_report_chats(raw: str) -> Dict[str, Any]:
+    if not raw.strip():
+        return {}
+
     try:
-        parsed = json.loads(_raw_report_chats)
+        parsed = json.loads(raw)
     except Exception:
-        parsed = _raw_report_chats.strip()
-    # Нормалізація у словник
+        parsed = raw.strip()
+
+    # Один chat_id для всіх
+    if isinstance(parsed, int):
+        return {"all": {"chat_id": parsed, "thread_id": None}}
+
+    if isinstance(parsed, str) and parsed.lstrip("-").isdigit():
+        return {"all": {"chat_id": int(parsed), "thread_id": None}}
+
+    # Словник
     if isinstance(parsed, dict):
-        REPORT_CHATS: Any = {str(k): int(v) for k, v in parsed.items()}
-    elif isinstance(parsed, int):
-        REPORT_CHATS: Any = {"all": parsed}
-    elif isinstance(parsed, str) and parsed.lstrip("-").isdigit():
-        REPORT_CHATS: Any = {"all": int(parsed)}
-    else:
-        REPORT_CHATS: Any = {}
-else:
-    REPORT_CHATS: Any = {}
+        normalized: Dict[str, Any] = {}
+        for k, v in parsed.items():
+            key = str(k)
+
+            # Старий формат: "1": -100...
+            if isinstance(v, int):
+                normalized[key] = {"chat_id": int(v), "thread_id": None}
+                continue
+
+            # Старий формат строкою
+            if isinstance(v, str) and v.lstrip("-").isdigit():
+                normalized[key] = {"chat_id": int(v), "thread_id": None}
+                continue
+
+            # Новий формат: {"chat_id": ..., "thread_id": ...}
+            if isinstance(v, dict):
+                chat_id = v.get("chat_id")
+                thread_id = v.get("thread_id")
+
+                if chat_id is None:
+                    continue
+
+                try:
+                    normalized[key] = {
+                        "chat_id": int(chat_id),
+                        "thread_id": int(thread_id) if thread_id is not None else None,
+                    }
+                except Exception:
+                    continue
+
+        return normalized
+
+    return {}
+
+REPORT_CHATS: Dict[str, Any] = _normalize_report_chats(_raw_report_chats)
 
 # Якщо хочеш у звіті давати лінки на угоди (не обов'язково):
 B24_DOMAIN = os.environ.get("B24_DOMAIN", "").strip()
@@ -81,7 +136,6 @@ async def _sleep_backoff(attempt: int, base: float = 0.5, cap: float = 8.0):
 
 async def b24(method: str, **params) -> Any:
     url = f"{BITRIX_WEBHOOK_BASE}/{method}.json"
-    # простий ретрай на ліміти/мережеві збої
     for attempt in range(6):
         try:
             async with HTTP.post(url, json=params) as resp:
@@ -89,7 +143,6 @@ async def b24(method: str, **params) -> Any:
                 if "error" in data:
                     err = data["error"]
                     desc = data.get("error_description")
-                    # ретраїмо тільки ліміт / тимчасові
                     if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS"):
                         log.warning("Bitrix rate-limit: %s (%s), retry #%s", err, desc, attempt + 1)
                         await _sleep_backoff(attempt)
@@ -121,6 +174,7 @@ async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.2, 
 
 # ------------------------ Caches --------------------------
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
+
 async def get_deal_type_map() -> Dict[str, str]:
     global _DEAL_TYPE_MAP
     if _DEAL_TYPE_MAP is None:
@@ -133,19 +187,26 @@ async def get_deal_type_map() -> Dict[str, str]:
 def normalize_type(type_name: str) -> str:
     t = (type_name or "").strip().lower()
     mapping_exact = {
-        "підключення": "connection", "подключение": "connection",
+        "підключення": "connection",
+        "подключение": "connection",
         "ремонт": "repair",
-        "сервісні роботи": "service", "сервисные работы": "service",
-        "сервіс": "service", "сервис": "service",
-        "перепідключення": "reconnection", "переподключение": "reconnection",
-        "аварія": "accident", "авария": "accident",
-        "роботи по лінії": "linework", "работы по линии": "linework",
-        "не выбран": "other", "не вибрано": "other",
-        "інше": "other", "прочее": "other",
+        "сервісні роботи": "service",
+        "сервисные работы": "service",
+        "сервіс": "service",
+        "сервис": "service",
+        "перепідключення": "reconnection",
+        "переподключение": "reconnection",
+        "аварія": "accident",
+        "авария": "accident",
+        "роботи по лінії": "linework",
+        "работы по линии": "linework",
+        "не выбран": "other",
+        "не вибрано": "other",
+        "інше": "other",
+        "прочее": "other",
     }
     if t in mapping_exact:
         return mapping_exact[t]
-    # м'які правила
     if any(k in t for k in ("підключ", "подключ")):
         return "connection"
     if "ремонт" in t:
@@ -171,12 +232,23 @@ REPORT_BUCKETS = [
 ]
 
 # ------------------------ Brigade mapping -----------------
-_BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
-_BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
+_BRIGADE_STAGE = {
+    1: "UC_XF8O6V",
+    2: "UC_0XLPCN",
+    3: "UC_204CP3",
+    4: "UC_TNEW3Z",
+    5: "UC_RMBZ37",
+}
+_BRIGADE_EXEC_OPTION_ID = {
+    1: 5494,
+    2: 5496,
+    3: 5498,
+    4: 5500,
+    5: 5502,
+}
 
-# ------------------------ Time helpers -------------------
+# ------------------------ Time helpers --------------------
 def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
-    # межі доби за Києвом, конвертовані в UTC ISO
     now_kyiv = datetime.now(REPORT_TZ)
     start_kyiv = (now_kyiv - timedelta(days=offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
     end_kyiv = start_kyiv + timedelta(days=1)
@@ -185,12 +257,11 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
     label = start_kyiv.strftime("%d.%m.%Y")
     return label, start_utc.isoformat(), end_utc.isoformat()
 
-def _day_key_in_tz() -> str:
-    return datetime.now(REPORT_TZ).strftime("%Y-%m-%d")
+def _day_key_in_tz(offset_days: int = 0) -> str:
+    return (datetime.now(REPORT_TZ) - timedelta(days=offset_days)).strftime("%Y-%m-%d")
 
-# ------------------------ Bitrix datetime parser -------------------
+# ------------------------ Bitrix datetime parser ----------
 def _parse_b24_dt(s: Optional[str]) -> Optional[datetime]:
-    """Безпечно парсимо ISO-дату з Bitrix у aware datetime."""
     if not s:
         return None
     try:
@@ -202,13 +273,15 @@ def _parse_b24_dt(s: Optional[str]) -> Optional[datetime]:
             return None
 
 # ------------------------ Anti-duplicate / rate limiting --
-# (chat_id, day_key, brigade) -> True (вже відправлено сьогодні)
-_sent_guard: Dict[Tuple[int, str, int], bool] = {}
-# останній час відправки в конкретний чат (секунди time.time())
-_last_chat_send_ts: Dict[int, float] = {}
-_CHAT_MIN_INTERVAL_SEC = 5  # мʼякий тротлінг: не частіше 1 повідомлення/5с у чат
+# (chat_id, thread_id, day_key, brigade) -> True
+_sent_guard: Dict[Tuple[int, int, str, int], bool] = {}
+_last_target_send_ts: Dict[Tuple[int, int], float] = {}
+_CHAT_MIN_INTERVAL_SEC = 5
 
-# ------------------------ Report core --------------------
+def _thread_key(thread_id: Optional[int]) -> int:
+    return thread_id or 0
+
+# ------------------------ Report core ---------------------
 async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], Dict[str, int], int]:
     """
     Повертає: (мітка дати, closed_counts_by_category, active_counts_by_category, overdue_repairs_24h)
@@ -216,7 +289,6 @@ async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[
     label, frm, to = _day_bounds(offset_days)
     deal_type_map = await get_deal_type_map()
 
-    # --- Закриті за добу
     exec_opt = _BRIGADE_EXEC_OPTION_ID.get(brigade)
     filter_closed = {"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to}
     if exec_opt:
@@ -237,7 +309,6 @@ async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[
         cls = normalize_type(tname)
         closed_counts[cls] = closed_counts.get(cls, 0) + 1
 
-    # --- Активні у стадії бригади (для SLA 24h беремо DATE_CREATE)
     stage_code = _BRIGADE_STAGE[brigade]
     active = await b24_list(
         "crm.deal.list",
@@ -299,87 +370,126 @@ def format_report(
 
     return "\n".join(lines)
 
-async def _safe_send(chat_id: int, text: str):
-    # мʼякий тротлінг по чату
+# ------------------------ Telegram target helpers ---------
+def _resolve_target_for_brigade(b: int) -> Optional[Dict[str, Optional[int]]]:
+    if not isinstance(REPORT_CHATS, dict):
+        return None
+
+    raw = REPORT_CHATS.get(str(b), REPORT_CHATS.get("all"))
+    if not raw:
+        return None
+
+    if isinstance(raw, dict):
+        chat_id = raw.get("chat_id")
+        thread_id = raw.get("thread_id")
+        if chat_id is None:
+            return None
+        try:
+            return {
+                "chat_id": int(chat_id),
+                "thread_id": int(thread_id) if thread_id is not None else None,
+            }
+        except Exception:
+            return None
+
+    # fallback на випадок нестандартного старого формату
+    if isinstance(raw, int):
+        return {"chat_id": int(raw), "thread_id": None}
+    if isinstance(raw, str) and raw.lstrip("-").isdigit():
+        return {"chat_id": int(raw), "thread_id": None}
+
+    return None
+
+async def _safe_send(chat_id: int, text: str, thread_id: Optional[int] = None):
+    target_key = (chat_id, _thread_key(thread_id))
+
     now = time.time()
-    last = _last_chat_send_ts.get(chat_id, 0.0)
+    last = _last_target_send_ts.get(target_key, 0.0)
     gap = _CHAT_MIN_INTERVAL_SEC - (now - last)
     if gap > 0:
         await asyncio.sleep(gap)
 
     for attempt in range(3):
         try:
-            await bot.send_message(chat_id, text, disable_web_page_preview=True)
-            _last_chat_send_ts[chat_id] = time.time()
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                message_thread_id=thread_id,
+                disable_web_page_preview=True,
+            )
+            _last_target_send_ts[target_key] = time.time()
             return
         except TelegramRetryAfter as e:
             retry_after = int(getattr(e, "retry_after", 15))
-            log.warning("telegram 429 in chat %s, retry_after=%s (attempt %s)", chat_id, retry_after, attempt + 1)
+            log.warning(
+                "telegram 429 in chat %s thread %s, retry_after=%s (attempt %s)",
+                chat_id, thread_id, retry_after, attempt + 1
+            )
             await asyncio.sleep(retry_after)
         except Exception as e:
-            log.warning("telegram send failed: %s, retry #%s", e, attempt + 1)
+            log.warning(
+                "telegram send failed: chat=%s thread=%s err=%s retry #%s",
+                chat_id, thread_id, e, attempt + 1
+            )
             await asyncio.sleep(2 + attempt * 2)
-    log.error("telegram send failed permanently (chat %s)", chat_id)
 
-def _resolve_chat_for_brigade(b: int) -> Optional[int]:
-    """
-    Підтримує обидва формати:
-    - dict: {"1": chat_id, "2": chat_id, ..., "all": chat_id}
-    - int (або рядок-цифра): один chat_id для всіх (нормалізується вище у {"all": chat_id})
-    """
-    # На випадок якщо хтось ще таки поклав int у REPORT_CHATS напряму
-    if isinstance(REPORT_CHATS, int):
-        return REPORT_CHATS
+    log.error("telegram send failed permanently (chat=%s thread=%s)", chat_id, thread_id)
 
-    if not isinstance(REPORT_CHATS, dict):
-        return None
-
-    key = str(b)
-    if key in REPORT_CHATS:
-        try:
-            return int(REPORT_CHATS[key])
-        except Exception:
-            return None
-
-    if "all" in REPORT_CHATS:
-        try:
-            return int(REPORT_CHATS["all"])
-        except Exception:
-            return None
-
-    return None
-
-async def _send_one_brigade_report(brigade: int, chat_id: int, offset_days: int) -> None:
+async def _send_one_brigade_report(
+    brigade: int,
+    chat_id: int,
+    thread_id: Optional[int],
+    offset_days: int,
+) -> None:
     try:
-        day_key = _day_key_in_tz()
-        guard_key = (chat_id, day_key, brigade)
+        day_key = _day_key_in_tz(offset_days)
+        guard_key = (chat_id, _thread_key(thread_id), day_key, brigade)
 
-        # Ідемпотентність: за сьогодні в цей чат по цій бригаді — тільки раз
-        if offset_days == 0 and _sent_guard.get(guard_key):
-            log.info("Skip duplicate: chat=%s day=%s brigade=%s", chat_id, day_key, brigade)
+        # Ідемпотентність: за конкретну дату в конкретний target по цій бригаді — тільки раз
+        if _sent_guard.get(guard_key):
+            log.info(
+                "Skip duplicate: chat=%s thread=%s day=%s brigade=%s",
+                chat_id, thread_id, day_key, brigade
+            )
             return
 
         label, closed_counts, active_counts, overdue_repairs_24h = await build_daily_report(brigade, offset_days)
-        await _safe_send(chat_id, format_report(brigade, label, closed_counts, active_counts, overdue_repairs_24h))
+        await _safe_send(
+            chat_id,
+            format_report(brigade, label, closed_counts, active_counts, overdue_repairs_24h),
+            thread_id=thread_id,
+        )
 
-        if offset_days == 0:
-            _sent_guard[guard_key] = True
+        _sent_guard[guard_key] = True
     except Exception as e:
         log.exception("Report for brigade %s failed", brigade)
-        await _safe_send(chat_id, f"❗️Помилка формування звіту для бригади №{brigade}: {html.escape(str(e))}")
+        await _safe_send(
+            chat_id,
+            f"❗️Помилка формування звіту для бригади №{brigade}: {html.escape(str(e))}",
+            thread_id=thread_id,
+        )
 
 async def send_all_brigades_report(offset_days: int = 0) -> None:
     tasks = []
     for b in (1, 2, 3, 4, 5):
-        chat_id = _resolve_chat_for_brigade(b)
-        if not chat_id:
-            log.warning("No chat configured for brigade %s", b)
+        target = _resolve_target_for_brigade(b)
+        if not target:
+            log.warning("No target configured for brigade %s", b)
             continue
-        tasks.append(_send_one_brigade_report(b, chat_id, offset_days))
+
+        tasks.append(
+            _send_one_brigade_report(
+                brigade=b,
+                chat_id=target["chat_id"],
+                thread_id=target["thread_id"],
+                offset_days=offset_days,
+            )
+        )
+
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
-# ------------------------ Manual command -----------------
+# ------------------------ Manual commands -----------------
 @dp.message(Command("report_now"))
 async def report_now(m: Message):
     try:
@@ -387,13 +497,22 @@ async def report_now(m: Message):
         offset = int(parts[1]) if len(parts) > 1 else 0
     except Exception:
         offset = 0
+
     await m.answer("Генерую звіти… ⏳")
     await send_all_brigades_report(offset)
     await m.answer("Готово ✅")
 
-# ------------------------ Scheduler ----------------------
+@dp.message(Command("where_am_i"))
+async def where_am_i(m: Message):
+    await m.answer(
+        "chat_id=<code>{}</code>\nthread_id=<code>{}</code>".format(
+            m.chat.id,
+            getattr(m, "message_thread_id", None),
+        )
+    )
+
+# ------------------------ Scheduler -----------------------
 def _next_run_dt(now_utc: datetime) -> datetime:
-    """Обчислити найближчу дату/час запуску REPORT_TIME за REPORT_TZ, повернути у UTC."""
     hh, mm = map(int, REPORT_TIME.split(":", 1))
     now_local = now_utc.astimezone(REPORT_TZ)
     target_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -405,10 +524,14 @@ async def scheduler_loop():
     log.info("[scheduler] started")
     while True:
         try:
-            # очистимо сторожі минулих днів (на випадок довгого аптайму)
-            day_now = _day_key_in_tz()
+            # очищаємо сторожі старих дат
+            valid_days = {
+                _day_key_in_tz(0),
+                _day_key_in_tz(1),
+                _day_key_in_tz(2),
+            }
             for k in list(_sent_guard.keys()):
-                if k[1] != day_now:
+                if k[2] not in valid_days:
                     _sent_guard.pop(k, None)
 
             now_utc = datetime.now(timezone.utc)
@@ -416,17 +539,17 @@ async def scheduler_loop():
             sleep_sec = (nxt - now_utc).total_seconds()
             if sleep_sec < 1:
                 sleep_sec = 1
+
             log.info("[scheduler] next run at %s (%s sec)", nxt.isoformat(), int(sleep_sec))
             await asyncio.sleep(sleep_sec)
 
             log.info("[scheduler] tick -> sending daily reports")
             await send_all_brigades_report(0)
-            # Далі цикл сам піде на наступну ітерацію і знов «заспить» до завтрашнього часу
         except Exception:
             log.exception("[scheduler] loop error")
             await asyncio.sleep(5)
 
-# ------------------------ Webhook plumbing ---------------
+# ------------------------ Webhook plumbing ----------------
 @app.on_event("startup")
 async def on_startup():
     global HTTP
@@ -434,6 +557,7 @@ async def on_startup():
 
     await bot.set_my_commands([
         BotCommand(command="report_now", description="Ручний запуск звітів (/report_now [offset])"),
+        BotCommand(command="where_am_i", description="Показати chat_id та thread_id"),
     ])
 
     url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
