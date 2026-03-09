@@ -1,4 +1,4 @@
-# main.py — reports-bot (FIXED v2)
+# main.py — reports-bot (v3 with AI daily summary)
 import asyncio
 import html
 import json
@@ -17,6 +17,7 @@ from aiogram.filters import Command
 from aiogram.types import BotCommand, Message, Update
 from aiogram.exceptions import TelegramRetryAfter
 from zoneinfo import ZoneInfo
+from openai import OpenAI
 
 # ------------------------ Settings ------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -24,25 +25,17 @@ BITRIX_WEBHOOK_BASE = os.environ["BITRIX_WEBHOOK_BASE"].rstrip("/")
 WEBHOOK_BASE = os.environ["WEBHOOK_BASE"].rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "secret")
 
-# TZ та час щоденного звіту
 REPORT_TZ_NAME = os.environ.get("REPORT_TZ", "Europe/Kyiv")
 REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
 REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
-# Увімкнення шедулера та «лідер» (щоб шедулер не дублювався на кількох інстансах)
 SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "true").lower() in ("1", "true", "yes", "y")
 LEADER = os.environ.get("LEADER", "0") == "1"
 
-# REPORT_CHATS підтримує формати:
-# 1) Один chat_id для всіх:
-#    REPORT_CHATS='-1001234567890'
-#
-# 2) Старий формат — словник chat_id:
-#    REPORT_CHATS='{"1": -100123, "2": -100124}'
-#
-# 3) Новий формат — forum topics:
-#    REPORT_CHATS='{"all": {"chat_id": -1003598162178, "thread_id": 8}}'
-#    REPORT_CHATS='{"1": {"chat_id": -1003598162178, "thread_id": 8}, ...}'
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+AI_SUMMARY_ENABLED = os.environ.get("AI_SUMMARY_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
+
 _raw_report_chats = os.environ.get("REPORT_CHATS", "")
 
 
@@ -94,7 +87,6 @@ def _normalize_report_chats(raw: str) -> Dict[str, Any]:
 
 REPORT_CHATS: Dict[str, Any] = _normalize_report_chats(_raw_report_chats)
 
-# Якщо хочеш у звіті давати лінки на угоди (не обов'язково):
 B24_DOMAIN = os.environ.get("B24_DOMAIN", "").strip()
 
 # ------------------------ Logging -------------------------
@@ -106,6 +98,7 @@ app = FastAPI()
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 HTTP: aiohttp.ClientSession
+OA_CLIENT: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ------------------------ Health --------------------------
 @app.get("/healthz")
@@ -294,7 +287,6 @@ def _parse_b24_dt(s: Optional[str]) -> Optional[datetime]:
             return None
 
 # ------------------------ Anti-duplicate / rate limiting --
-# (chat_id, thread_id, day_key, brigade) -> True
 _sent_guard: Dict[Tuple[int, int, str, int], bool] = {}
 _last_target_send_ts: Dict[Tuple[int, int], float] = {}
 _CHAT_MIN_INTERVAL_SEC = 5
@@ -303,15 +295,97 @@ _CHAT_MIN_INTERVAL_SEC = 5
 def _thread_key(thread_id: Optional[int]) -> int:
     return thread_id or 0
 
+# ------------------------ AI helpers ----------------------
+def _empty_bucket_counts() -> Dict[str, int]:
+    return {k: 0 for k, _ in REPORT_BUCKETS}
+
+
+def _sum_bucket_counts(items: List[Dict[str, int]]) -> Dict[str, int]:
+    total = _empty_bucket_counts()
+    for item in items:
+        for k in total.keys():
+            total[k] += int(item.get(k, 0))
+    return total
+
+
+async def build_ai_summary(report_rows: List[Dict[str, Any]]) -> Optional[str]:
+    if not AI_SUMMARY_ENABLED:
+        return None
+    if not OA_CLIENT:
+        log.info("AI summary skipped: OPENAI_API_KEY is not configured")
+        return None
+    if not report_rows:
+        return None
+
+    total_closed = _sum_bucket_counts([r["closed_counts"] for r in report_rows])
+    total_active = _sum_bucket_counts([r["active_counts"] for r in report_rows])
+    total_overdue = sum(int(r["overdue_repairs_24h"]) for r in report_rows)
+
+    best_brigade = max(
+        report_rows,
+        key=lambda r: sum(r["closed_counts"].values()),
+        default=None,
+    )
+
+    payload = {
+        "date": report_rows[0]["date_label"],
+        "totals": {
+            "closed_total": sum(total_closed.values()),
+            "active_total": sum(total_active.values()),
+            "overdue_repairs_24h": total_overdue,
+            "closed_by_category": total_closed,
+            "active_by_category": total_active,
+        },
+        "brigades": [
+            {
+                "brigade": r["brigade"],
+                "title": _BRIGADE_TITLE.get(r["brigade"], f"Бригада №{r['brigade']}"),
+                "closed_total": sum(r["closed_counts"].values()),
+                "active_total": sum(r["active_counts"].values()),
+                "overdue_repairs_24h": r["overdue_repairs_24h"],
+                "closed_counts": r["closed_counts"],
+                "active_counts": r["active_counts"],
+            }
+            for r in report_rows
+        ],
+        "best_brigade": {
+            "brigade": best_brigade["brigade"],
+            "title": _BRIGADE_TITLE.get(best_brigade["brigade"], f"Бригада №{best_brigade['brigade']}"),
+            "closed_total": sum(best_brigade["closed_counts"].values()),
+        } if best_brigade else None,
+    }
+
+    instructions = (
+        "Ти аналітик сервісної служби. "
+        "Напиши короткий підсумок українською для Telegram на основі JSON. "
+        "Не вигадуй числа, використовуй тільки ті, що є в JSON. "
+        "Стиль дружній, 5-8 рядків. "
+        "Скажи загальний результат дня, основні типи виконаних робіт, "
+        "відзнач найкращу бригаду. "
+        "Якщо є відкриті ремонти понад 24 години — коротко згадай це. "
+        "Можна використовувати HTML теги <b>. "
+        "Без списків з тире. Без хештегів. Без вигаданих причин."
+    )
+
+    def _call_openai() -> str:
+        response = OA_CLIENT.responses.create(
+            model=OPENAI_MODEL,
+            instructions=instructions,
+            input=json.dumps(payload, ensure_ascii=False),
+        )
+        return response.output_text.strip()
+
+    try:
+        return await asyncio.to_thread(_call_openai)
+    except Exception as e:
+        log.warning("AI summary failed: %s", e)
+        return None
+
 # ------------------------ Report core ---------------------
 async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], Dict[str, int], int]:
-    """
-    Повертає: (мітка дати, closed_counts_by_category, active_counts_by_category, overdue_repairs_24h)
-    """
     label, frm, to = _day_bounds(offset_days)
     deal_type_map = await get_deal_type_map()
 
-    # --- Закриті за добу
     exec_opt = _BRIGADE_EXEC_OPTION_ID.get(brigade)
     filter_closed = {
         "STAGE_ID": "C20:WON",
@@ -336,7 +410,6 @@ async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[
         cls = normalize_type(tname)
         closed_counts[cls] = closed_counts.get(cls, 0) + 1
 
-    # --- Активні у стадії бригади
     stage_code = _BRIGADE_STAGE[brigade]
     active = await b24_list(
         "crm.deal.list",
@@ -471,7 +544,7 @@ async def _send_one_brigade_report(
     chat_id: int,
     thread_id: Optional[int],
     offset_days: int,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     try:
         day_key = _day_key_in_tz(offset_days)
         guard_key = (chat_id, _thread_key(thread_id), day_key, brigade)
@@ -481,7 +554,7 @@ async def _send_one_brigade_report(
                 "Skip duplicate: chat=%s thread=%s day=%s brigade=%s",
                 chat_id, thread_id, day_key, brigade
             )
-            return
+            return None
 
         label, closed_counts, active_counts, overdue_repairs_24h = await build_daily_report(brigade, offset_days)
         await _safe_send(
@@ -491,6 +564,16 @@ async def _send_one_brigade_report(
         )
 
         _sent_guard[guard_key] = True
+
+        return {
+            "brigade": brigade,
+            "date_label": label,
+            "closed_counts": closed_counts,
+            "active_counts": active_counts,
+            "overdue_repairs_24h": overdue_repairs_24h,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
     except Exception as e:
         log.exception("Report for brigade %s failed", brigade)
         await _safe_send(
@@ -498,6 +581,7 @@ async def _send_one_brigade_report(
             f"❗️Помилка формування звіту для бригади №{brigade}: {html.escape(str(e))}",
             thread_id=thread_id,
         )
+        return None
 
 
 async def send_all_brigades_report(offset_days: int = 0) -> None:
@@ -518,8 +602,25 @@ async def send_all_brigades_report(offset_days: int = 0) -> None:
             )
         )
 
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    if not tasks:
+        return
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    report_rows: List[Dict[str, Any]] = []
+    for r in results:
+        if isinstance(r, dict):
+            report_rows.append(r)
+
+    if report_rows:
+        ai_text = await build_ai_summary(report_rows)
+        if ai_text:
+            first = report_rows[0]
+            await _safe_send(
+                first["chat_id"],
+                f"🤖 <b>Підсумок дня від AI</b>\n\n{ai_text}",
+                thread_id=first["thread_id"],
+            )
 
 # ------------------------ Manual commands -----------------
 @dp.message(Command("report_now"))
@@ -597,6 +698,11 @@ async def on_startup():
     url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
     await bot.set_webhook(url)
     log.info("[startup] webhook set to %s", url)
+
+    if OA_CLIENT:
+        log.info("[ai] enabled model=%s", OPENAI_MODEL)
+    else:
+        log.info("[ai] disabled (OPENAI_API_KEY missing)")
 
     if SCHEDULER_ENABLED and LEADER:
         asyncio.create_task(scheduler_loop())
